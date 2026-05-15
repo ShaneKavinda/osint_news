@@ -1,0 +1,6 @@
+collectors/.env
+*.session
+*.session-journal
+data/*.db
+data/*.json
+data/*.jsonl
