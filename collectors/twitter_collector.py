@@ -3,128 +3,215 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import datetime
 import time
-# We assume twikit is installed and handles Twitter interaction
-try:
-    from twikit.twitter import TwitterClient
-except ImportError:
-    print("Error: 'twikit' library not found. Please ensure it is installed.")
-    TwitterClient = None
+import os
+import re
+from urllib.parse import quote_plus
+import random
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 COLLECTOR_DIR = "collectors"
+MAX_HASHTAGS = 10
+REQUEST_DELAY_SECONDS = random.randint(3, 10)
+
 
 def get_trending_hashtags(source_url: str) -> list[str]:
-    """
-    Scrapes trending hashtags from a given public source URL (e.g., trends24).
-    This function is highly dependent on the website's structure and may need updates.
-    """
     print(f"Attempting to scrape trends from: {source_url}")
-    try:
-        # Fetch the page content
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/Chrome'
-        }
-        response = requests.get(source_url, headers=headers, timeout=10)
-        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
 
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Placeholder logic: You need to find the correct CSS selector/HTML tag for trends on the target site.
-        # Example assumption based on common web structures:
-        trend_elements = soup.find_all('a', class_='hashtag-link') # <--- !!! UPDATE THIS CLASS NAME !!!
-        
-        hashtags = []
-        for element in trend_elements[:10]: # Limit to 10 for safety
-            # Extract the hashtag text, e.g., "#TopicName"
-            text = element.get_text(strip=True)
-            if text and text.startswith('#'):
-                hashtags.append(text[1:]) # Remove '#' for cleaner data
-        
-        print(f"Scraped {len(hashtags)} potential hashtags.")
-        return list(set(hashtags))
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/91.0.4472.124 Safari/537.36"
+            )
+        }
+
+        response = requests.get(source_url, headers=headers, timeout=10)
+        response.raise_for_status()
 
     except requests.exceptions.RequestException as e:
-        print(f"Error scraping trends from {source_url}: {e}")
-        # Fallback to a predefined list if scraping fails
+        print(f"Error accessing trend page {source_url}: {e}")
+        print("Falling back to hardcoded trends.")
         return ["trendingtopic1", "technews", "worldevents"]
 
+    soup = BeautifulSoup(response.content, "html.parser")
+    hashtags = set()
 
-def fetch_top_tweets(hashtags: list[str]) -> pd.DataFrame:
-    """
-    Uses twikit/TwitterClient to fetch the top tweets for a list of hashtags.
-    Returns a DataFrame containing structured tweet data.
-    """
-    if not TwitterClient:
-        print("Cannot fetch tweets because twikit is not available or initialized.")
-        return pd.DataFrame()
+    trend_links = soup.find_all("a", class_="trend-link")
 
-    all_tweet_data = []
-    # In a real scenario, API keys and authentication would be loaded from environment variables
-    # Example Client Initialization (Requires actual credentials setup)
+    for link in trend_links:
+        href = link.get("href", "")
+        text = link.get_text(strip=True)
+
+        raw_hashtag = None
+
+        if text:
+            raw_hashtag = text.lstrip("#").strip()
+        elif href:
+            match = re.search(r"(?:[?&]q=|/#)([a-zA-Z0-9_]+)", href)
+            if match:
+                raw_hashtag = match.group(1)
+
+        if raw_hashtag:
+            decoded = requests.utils.unquote(raw_hashtag).lstrip("#").strip()
+            if len(decoded) > 2:
+                hashtags.add(decoded)
+
+    final_list = sorted(list(hashtags))
+    print(f"Scraped {len(final_list)} unique hashtags/topics from the page.")
+    return final_list
+
+
+def fetch_nitter_html_with_playwright(page, query: str) -> str:
+    url = f"https://nitter.net/search?f=tweets&q={quote_plus(query)}"
+    print(f"Opening with browser: {url}")
+
     try:
-        print("Attempting to initialize Twitter client...")
-        client = TwitterClient(api_key="YOUR_API_KEY", api_secret="YOUR_SECRET")
-        client.connect() # Assuming connect() method exists
-        print("Twitter Client connected successfully.")
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        # Give Nitter a little time to render/load timeline content.
+        page.wait_for_timeout(3000)
+
+        html = page.content()
+
+        print("HTML length from browser:", len(html))
+        print("First 300 chars:", repr(html[:300]))
+
+        return html
+
+    except PlaywrightTimeoutError:
+        print(f"Playwright timeout for query: {query}")
+        return ""
     except Exception as e:
-        print(f"Error initializing Twitter Client (check credentials/setup): {e}")
-        return pd.DataFrame()
+        print(f"Playwright error for query {query}: {e}")
+        return ""
 
-    for hashtag in hashtags:
-        print(f"\nFetching tweets for: #{hashtag}...")
-        try:
-            # Assuming the client has a method to fetch tweets by hashtag
-            tweets = client.get_tweets_by_hashtag(query=hashtag, limit=5) 
-            
-            for tweet in tweets:
-                all_tweet_data.append({
-                    'Hashtag': f"#{hashtag}",
-                    'Tweet Text': tweet['text'],
-                    'User ID': str(tweet['user']['id']),
-                    'Author Username': tweet['user']['screen_name'],
-                    'Post Date/Time': tweet['created_at'],
-                })
-            print(f"Successfully collected {len(tweets)} tweets for #{hashtag}.")
 
-        except Exception as e:
-            print(f"Could not fetch tweets for #{hashtag}. Error: {e}")
+def parse_nitter_tweets_from_html(html: str, query: str, max_tweets: int = 5) -> list[dict]:
+    if not html.strip():
+        return []
 
-    return pd.DataFrame(all_tweet_data)
+    soup = BeautifulSoup(html, "html.parser")
+
+    tweet_containers = soup.select(".timeline-item")
+
+    if not tweet_containers:
+        print(f"No .timeline-item containers found for {query}.")
+        return []
+
+    rows = []
+
+    for container in tweet_containers[:max_tweets]:
+        text_el = container.select_one(".tweet-content")
+        user_el = container.select_one(".username")
+        fullname_el = container.select_one(".fullname")
+        date_el = container.select_one(".tweet-date a")
+        avatar_el = container.select_one(".avatar")
+        media_el = container.select_one(".attachments, .gallery-row, .attachment")
+
+        tweet_text = text_el.get_text(" ", strip=True) if text_el else ""
+        username = user_el.get_text(strip=True) if user_el else "Unknown"
+        fullname = fullname_el.get_text(" ", strip=True) if fullname_el else ""
+        post_time = date_el.get("title") if date_el else ""
+        relative_link = date_el.get("href") if date_el else ""
+
+        if relative_link.startswith("/"):
+            tweet_url = "https://nitter.net" + relative_link
+        else:
+            tweet_url = relative_link
+
+        has_media = "Yes" if media_el else "No"
+
+        if tweet_text:
+            rows.append({
+                "Trend": query,
+                "Hashtag": f"#{query}",
+                "Author Name": fullname,
+                "Author Username": username,
+                "Tweet Text": tweet_text,
+                "Post Date/Time": post_time,
+                "Tweet URL": tweet_url,
+                "Has Media": has_media,
+                "Source": "Nitter HTML via Playwright",
+                "Collection Time": datetime.datetime.now().isoformat(timespec="seconds"),
+            })
+
+    return rows
+
+
+def fetch_top_tweets_with_playwright(hashtags: list[str]) -> pd.DataFrame:
+    all_rows = []
+
+    print("--- Starting Tweet Collection from Nitter using Playwright ---")
+
+    if MAX_HASHTAGS is not None:
+        hashtags = hashtags[:MAX_HASHTAGS]
+
+    with sync_playwright() as p:
+        browser = p.firefox.launch(headless=False)
+
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) "
+                "Gecko/20100101 Firefox/150.0"
+            ),
+            viewport={"width": 1366, "height": 768},
+            locale="en-US",
+        )
+
+        page = context.new_page()
+
+        for hashtag in hashtags:
+            print(f"\nCollecting tweets for: {hashtag}")
+
+            html = fetch_nitter_html_with_playwright(page, hashtag)
+            rows = parse_nitter_tweets_from_html(html, hashtag, max_tweets=5)
+
+            if rows:
+                print(f"Collected {len(rows)} tweets for {hashtag}.")
+                all_rows.extend(rows)
+            else:
+                print(f"No tweets collected for {hashtag}.")
+
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+        browser.close()
+
+    return pd.DataFrame(all_rows)
 
 
 def run_collector():
-    """Main function to orchestrate the data collection process."""
-    print("--- Starting Twitter Data Collector ---")
-    
-    # Step 1: Fetch Trending Hashtags (using a public scrape URL as per plan/user choice)
-    TWEETR_SOURCE_URL = "https://trends24.in" # Example placeholder URL
-    hashtags = get_trending_hashtags(TWEETR_SOURCE_URL)
+    print("--- Starting Twitter/Nitter Browser Collector ---")
+
+    trends_source_url = "https://trends24.in"
+    hashtags = get_trending_hashtags(trends_source_url)
 
     if not hashtags:
-        print("Could not retrieve any trending hashtags. Exiting.")
+        print("Could not retrieve any trending hashtags/topics. Exiting.")
         return pd.DataFrame()
-    
-    # Step 2: Fetch Top Tweets for each hashtag
-    tweet_df = fetch_top_tweets(hashtags)
 
-    # Step 3: Save to Parquet
-    if not tweet_df.empty:
-        timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"twitter_trends_{timestamp_str}.parquet"
-        output_filepath = f"{COLLECTOR_DIR}/{output_filename}"
-        
-        try:
-            # Ensure the directory exists
-            import os
-            os.makedirs(COLLECTOR_DIR, exist_ok=True)
-            
-            tweet_df.to_parquet(output_filepath, index=False)
-            print(f"\n✅ Success! All data saved to {output_filepath}")
-        except Exception as e:
-            print(f"Error saving Parquet file: {e}")
+    tweet_df = fetch_top_tweets_with_playwright(hashtags)
+
+    if tweet_df.empty:
+        print("\nNo tweet data collected.")
+        return tweet_df
+
+    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = f"twitter_trends_nitter_browser_{timestamp_str}.parquet"
+    output_filepath = os.path.join("data", output_filename)
+
+    try:
+        os.makedirs(COLLECTOR_DIR, exist_ok=True)
+        tweet_df.to_parquet(output_filepath, index=False)
+        print(f"\n✅ Success! Data saved to {output_filepath}")
+    except Exception as e:
+        print(f"Error saving Parquet file: {e}")
+
+    print("\nPreview:")
+    print(tweet_df.head())
 
     return tweet_df
 
+
 if __name__ == "__main__":
-    # Note: This script is a template. Actual API keys and scraper selectors 
-    # must be implemented by the user based on the target site/API documentation.
     run_collector()

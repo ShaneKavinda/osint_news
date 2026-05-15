@@ -11,3 +11,4 @@ python-dotenv==1.2.2
 pyarrow
 twikit
 beautifulsoup4
+playwright

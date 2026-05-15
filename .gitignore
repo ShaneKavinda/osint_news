@@ -4,3 +4,4 @@ collectors/.env
 data/*.db
 data/*.json
 data/*.jsonl
+data/
